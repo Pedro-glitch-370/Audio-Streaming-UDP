@@ -25,6 +25,7 @@ from config import (
     EXTENSOES_SUPORTADAS,
     FALLBACK_BITRATE_KBPS,
     SEGUNDOS_PRE_BUFFER,
+    VELOCIDADE_PREBUFFER,
     TAMANHO_BUFFER,
 )
 
@@ -36,11 +37,6 @@ SEQ_FIM = 0xFFFFFFFF
 # Payload máximo por datagrama;
 # Mais que 1400 bytes o IP fragmenta o pacote, perdendo o datagrama todo
 TAMANHO_DATAGRAMA = min(TAMANHO_BUFFER, 1400)
-
-# No pré-buffer o envio é até N vezes mais rápido que o tempo real;
-# Em UDP uma rajada pode estourar o buffer de recepção do SO do cliente
-# e os datagramas acabam sendo descartados
-_FATOR_PREBUFFER = 4
 
 # Função que retorna nomes dos arquivos de áudio disponíveis (ordem alfabética)
 def listar_arquivos_audio():
@@ -143,7 +139,7 @@ def enviar_arquivo_streaming(
                 break
 
             if bytes_enviados < bytes_prebuffer:
-                liberar_em = comeco + bytes_enviados / (taxa_bytes * _FATOR_PREBUFFER)
+                liberar_em = comeco + bytes_enviados / VELOCIDADE_PREBUFFER
             else:
                 liberar_em = comeco + (bytes_enviados - bytes_prebuffer) / taxa_bytes
             delay = liberar_em - time.monotonic()

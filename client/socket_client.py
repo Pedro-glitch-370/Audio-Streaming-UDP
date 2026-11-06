@@ -241,16 +241,16 @@ def iniciar_streaming(nome_arquivo: str) -> Sessao:
             encerrar()
 
     # Função que entrega os bytes pro decodificador MP3;
-    # qualquer sobra de datagrama fica nesse "resto"
-    resto = bytearray()
+    resto = bytearray() # qualquer sobra de datagrama fica nesse "resto"
+    fim = False  # vira True quando o stream acaba
 
     def ler_mp3(n: int) -> bytes:
-        if sessao._parado:
-            return b""
-        if not resto:
+        nonlocal fim
+        while len(resto) < n and not fim and not sessao._parado:
             dados = proximo_payload()
             if not dados:
-                return b""
+                fim = True
+                break
             resto.extend(dados)
         saida = bytes(resto[:n])
         del resto[:n]

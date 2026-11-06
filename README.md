@@ -1,13 +1,13 @@
-# SPOTCIN - Audio Streaming TCP
+# SPOTCIN - Audio Streaming UDP
 
-Streaming de áudio WAV ou MP3 via sockets TCP.
+Streaming de áudio WAV ou MP3 via sockets UDP.
 O servidor divide o arquivo em blocos e envia em ritmo de reprodução (tempo real) para cada cliente.
 O cliente guarda os blocos num buffer, espera um pré-buffer encher e, depois, toca na placa de som.
 
 ## Estrutura
 
 ```
-audio-streaming-tcp/
+audio-streaming-udp/
 ├── config.py
 ├── requirements.txt
 ├── audio_files/
