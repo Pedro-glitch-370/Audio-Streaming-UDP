@@ -1,12 +1,14 @@
+import io
 import json
 import socket
+import struct
 import threading
 import wave
 from dataclasses import dataclass
 
 import miniaudio
 
-from config import HOST, PORT, TAMANHO_BUFFER, SEGUNDOS_PRE_BUFFER
+from config import HOST, PORT, SEGUNDOS_PRE_BUFFER
 from client.playback_buffer import Buffer
 
 # Mapeia bytes por amostra → dtype do sounddevice.
@@ -23,7 +25,14 @@ _FORMATO_MP3 = {
 }
 _TAXA_PCM_MP3 = 44100 * 2 * 2  # bytes por segundo do MP3 já decodificado
 
-# Classe interna que entrega os bytes ao decodificador MP3 conforme eles chegam do do socket
+# Mesmo formato do servidor: [seq (4 bytes)][payload]; seq = SEQ_FIM marca o fim.
+_CAB = struct.Struct("!I")
+_SEQ_FIM = 0xFFFFFFFF
+
+_TIMEOUT_SOCKET = 0.5        # cada recv espera no máximo isso
+_TIMEOUT_INATIVIDADE = 5.0   # timeout de erro se n tem nenhum datagrama por tanto tempo
+
+# Classe interna que entrega os bytes ao decodificador MP3 conforme eles chegam do socket
 class _FonteRede(miniaudio.StreamableSource):
 
     def __init__(self, ler):
@@ -54,6 +63,18 @@ def _ler_cabecalho_wav(fp):
         "tamanho_dados": wav.getnframes() * canais * bytes_amostra,
     }
 
+# Função que envia um comando e devolve o primeiro datagrama de resposta;
+# Como o comando ou a resposta podem se perder, ela transmite dnv se nada chegar
+def _handshake(sock: socket.socket, comando: bytes, tentativas=3, espera=2.0) -> bytes:
+    sock.settimeout(espera)
+    for _ in range(tentativas):
+        sock.send(comando)
+        try:
+            return sock.recv(65535)
+        except socket.timeout:
+            continue
+    raise ConnectionError("Servidor não respondeu")
+
 # Classe que carrega tudo que a main precisa pra tocar e parar um áudio
 @dataclass
 class Sessao:
@@ -61,7 +82,7 @@ class Sessao:
     OBS: Os elementos que essa classe agrupa são:
       - o Buffer (consumido pelo player)
       - os metadados de formato
-      - o socket (para fechar quando a main pedir)
+      - o socket (UDP "conectado" ao servidor)
       - o estado interno da thread de rede (parado / erro)
     """
 
@@ -76,48 +97,53 @@ class Sessao:
     def get_erro(self):
         return self._erro
 
-    # Função que encerra a thread de rede e o socket;
+    # Função que encerra a thread de rede;
     # A main chama ela no finally
     def parar(self):
         self._parado = True
         try:
-            # shutdown força o read() em andamento a retornar imediatamente.
-            self.sock.shutdown(socket.SHUT_RDWR)
+            # Em UDP fechar o socket não avisa o servidor: é preciso pedir o fim.
+            # A thread de rede percebe _parado em até _TIMEOUT_SOCKET e fecha o socket.
+            self.sock.send(b"STOP")
         except OSError:
-            pass  # socket já tá fechado
-        self.sock.close()
+            pass  # socket já foi fechado pela thread
 
-# Função que conecta ao servidor, envia PLAY, lê cabeçalho
-# e dispara a thread que baixa o áudio em segundo plano
+# Função que envia PLAY ao servidor, lê o cabeçalho
+# e dispara a thread que recebe o áudio em segundo plano
 def iniciar_streaming(nome_arquivo: str) -> Sessao:
 
-    sock = socket.create_connection((HOST, PORT), timeout=30)
+    # connect no UDP não abre conexão, só fixa o destino
+    # e faz o SO descartar datagramas de outro endereço
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.connect((HOST, PORT))
+
+    inicial = b"" # bytes de áudio que vieram com o cabeçalho do .wav
+    proximo_seq = 0 # próximo número de sequência que é esperado
 
     try:
-        # Comando do protocolo: "PLAY <nome_arquivo>\n"
-        sock.sendall(f"PLAY {nome_arquivo}\n".encode())
-        fp = sock.makefile("rb")
-
-        # 1ª linha da resposta: JSON com status e metadados (taxa_bytes, tamanho).
-        linha = fp.readline()
-        if not linha:
-            raise ConnectionError("Servidor fechou conexão sem responder")
-
-        info = json.loads(linha)
+        # JSON datagrama de resposta, vem com status e metadados
+        info = json.loads(_handshake(sock, f"PLAY {nome_arquivo}".encode()))
         if info.get("status") != "ok":
             raise RuntimeError(info.get("message", "Erro desconhecido do servidor"))
 
         eh_mp3 = info["nome_arquivo"].lower().endswith(".mp3")
 
         if eh_mp3:
-            # No MP3 o arquivo inteiro é dado de áudio.
+            # Se for .mp3, o arquivo inteiro é dado de áudio
             formato = dict(_FORMATO_MP3, tamanho_dados=info["tamanho"])
         else:
-            # Depois do JSON vem o WAV cru; pulamos o cabeçalho dele.
-            formato = _ler_cabecalho_wav(fp)
+            # Se for .wav, o cabeçalho vai tá no datagrama de seq 0
+            sock.settimeout(_TIMEOUT_INATIVIDADE)
+            datagrama = sock.recv(65535)
+            seq, payload = _CAB.unpack_from(datagrama)[0], datagrama[_CAB.size:]
+            if seq != 0:
+                raise ConnectionError("Datagrama com o cabeçalho do WAV foi perdido")
+            cabecalho = io.BytesIO(payload)
+            formato = _ler_cabecalho_wav(cabecalho)
+            inicial = payload[cabecalho.tell():]  # áudio que sobrou no msm datagrama
+            proximo_seq = 1
 
     except Exception:
-        # Qualquer falha aqui significa que não vamos mais usar o socket.
         sock.close()
         raise
 
@@ -127,79 +153,110 @@ def iniciar_streaming(nome_arquivo: str) -> Sessao:
     buffer = Buffer(int(taxa_buffer * SEGUNDOS_PRE_BUFFER))
     sessao = Sessao(buffer=buffer, formato=formato, sock=sock)
 
-    # Quantos bytes ainda faltam receber. Se o servidor informou um tamanho
-    # de dados válido e menor que o total anunciado, usamos ele para saber
-    # exatamente quando parar (evita ler lixo ou ficar esperando EOF).
+    # Tamanho do payload de cada datagrama, bom pra preencher as perdas
+    tam_payload = info["tamanho_chunk"]
+
+    # Quantos bytes ainda faltam receber;
+    # se o servidor informou um tamanho de dados válido e menor
+    # que o total, ele é usado pra saber quando parar
     restante = formato["tamanho_dados"] or None
     if restante is None or restante > info["tamanho"]:
-        restante = None  # não confiável; lê até a conexão fechar
+        restante = None  # espera o datagrama de fim
 
-    # Função que baixa blocos e joga no buffer até acabar ou parar
-    def receber():
-        nonlocal restante  # modificamos o valor de fora do escopo
+    if restante is not None:
+        inicial = inicial[:restante]
+        restante -= len(inicial)
 
-        try:
-            while not sessao._parado and restante != 0:
-                # Nunca pedir mais do que resta, se sabemos o total.
-                n = TAMANHO_BUFFER if restante is None else min(TAMANHO_BUFFER, restante)
-                chunk = fp.read(n)
+    sock.settimeout(_TIMEOUT_SOCKET)
 
-                if not chunk:
-                    # EOF inesperado: conexão fechou antes do previsto.
-                    if restante and not sessao._parado:
-                        sessao._erro = f"Conexão encerrada com {restante} bytes faltando"
-                    break
+    # Função que devolve os próximos bytes do arquivo na ordem;
+    # retorna None quando o stream acaba
+    def proximo_payload() -> bytes | None:
+        nonlocal proximo_seq, restante
+        ocioso = 0.0
 
-                buffer.adicionar_chunk(chunk)
-                if restante is not None:
-                    restante -= len(chunk)
-
-        except OSError as e:
-            # Erro de rede (reset, timeout, etc.). Só registra se não fomos nós
-            # que pedimos para parar (nesse caso, o erro é esperado).
-            if not sessao._parado:
-                sessao._erro = f"Erro ao receber dados: {e}"
-
-        finally:
-            # Em qualquer caso (sucesso, erro, parada), avisa o buffer que acabou
-            # e libera os recursos. Sem isso o player pode travar esperando dados.
-            buffer.finalizar()
+        while not sessao._parado and restante != 0:
             try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            fp.close()
-            sock.close()
+                datagrama = sock.recv(65535)
+            except socket.timeout:
+                ocioso += _TIMEOUT_SOCKET
+                if ocioso >= _TIMEOUT_INATIVIDADE:
+                    sessao._erro = "Servidor parou de enviar dados"
+                    return None
+                continue
+            except OSError as e:
+                if not sessao._parado:
+                    sessao._erro = f"Erro ao receber dados: {e}"
+                return None
 
-    # Função que lê do socket sem passar do total;
-    # Ela é chamada pelo decodificador MP3
-    def ler_mp3(n: int) -> bytes:
-        nonlocal restante
+            if len(datagrama) < _CAB.size:
+                continue
+            seq = _CAB.unpack_from(datagrama)[0]
+            payload = datagrama[_CAB.size:]
 
-        if sessao._parado or restante == 0:
-            return b""
-        if restante is not None:
-            n = min(n, restante)
+            if seq == _SEQ_FIM:
+                if restante:
+                    sessao._erro = f"Transmissão encerrada com {restante} bytes faltando"
+                return None
+            if seq < proximo_seq:
+                continue  # duplicado ou atrasado demais
 
+            # Datagramas que vieram entre o esperado e o recebido foram perdidos
+            perdidos = (seq - proximo_seq) * tam_payload
+            proximo_seq = seq + 1
+
+            if restante is not None:
+                perdidos = min(perdidos, restante)
+                restante -= perdidos
+                payload = payload[:restante]
+                restante -= len(payload)
+
+            # se for .wav, preenche a perda com silêncio pra manter o alinhamento
+            # se for .mp3, não dá pra inventar nada pra tapar
+            return (b"" if eh_mp3 else bytes(perdidos)) + payload
+
+        return None
+
+    # Função que avisa o fim ao buffer e libera os recursos
+    def encerrar():
+        buffer.finalizar()
         try:
-            # read1 devolve o que já chegou, sem esperar juntar n bytes.
-            chunk = fp.read1(n)
-        except OSError as e:
-            # O decodificador engoliria a exceção, então registramos aqui.
-            if not sessao._parado:
-                sessao._erro = f"Erro ao receber dados: {e}"
-            return b""
+            sock.send(b"STOP")  # garante que o servidor não vai continuar enviando
+        except OSError:
+            pass
+        sock.close()
 
-        if not chunk:
-            if restante and not sessao._parado:
-                sessao._erro = f"Conexão encerrada com {restante} bytes faltando"
-            return b""
+    # Função que recebe os datagramas e joga no buffer até acabar ou parar
+    def receber():
+        try:
+            if inicial:
+                buffer.adicionar_chunk(inicial)
+            while True:
+                dados = proximo_payload()
+                if dados is None:
+                    break
+                if dados:
+                    buffer.adicionar_chunk(dados)
+        finally:
+            encerrar()
 
-        if restante is not None:
-            restante -= len(chunk)
-        return chunk
+    # Função que entrega os bytes pro decodificador MP3;
+    resto = bytearray() # qualquer sobra de datagrama fica nesse "resto"
+    fim = False  # vira True quando o stream acaba
 
-    #Função que decodifica o MP3 conforme os bytes chegam
+    def ler_mp3(n: int) -> bytes:
+        nonlocal fim
+        while len(resto) < n and not fim and not sessao._parado:
+            dados = proximo_payload()
+            if not dados:
+                fim = True
+                break
+            resto.extend(dados)
+        saida = bytes(resto[:n])
+        del resto[:n]
+        return saida
+
+    # Função que decodifica o MP3 conforme os bytes chegam
     def receber_mp3():
         try:
             decodificador = miniaudio.stream_any(
@@ -218,27 +275,18 @@ def iniciar_streaming(nome_arquivo: str) -> Sessao:
                 sessao._erro = f"Erro ao decodificar MP3: {e}"
 
         finally:
-            buffer.finalizar()
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            fp.close()
-            sock.close()
+            encerrar()
 
     threading.Thread(target=receber_mp3 if eh_mp3 else receber, daemon=True).start()
     return sessao
 
 # Função que pergunta ao servidor quais arquivos ele tem disponíveis (comando LIST);
-# Ela retorna uma lista de nomes ou [] se o servidor responder erro
+# Ela retorna uma lista de nomes ou levanta erro se o servidor responder erro
 def listar_arquivos() -> list[str]:
-    sock = socket.create_connection((HOST, PORT), timeout=10)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sock.sendall(b"LIST\n")
-        linha = sock.makefile("rb").readline()
-        if not linha:
-            raise ConnectionError("Servidor fechou conexão sem responder")
-        info = json.loads(linha)
+        sock.connect((HOST, PORT))
+        info = json.loads(_handshake(sock, b"LIST"))
         if info.get("status") != "ok":
             raise RuntimeError(info.get("message", "Erro desconhecido do servidor"))
         return info["files"]

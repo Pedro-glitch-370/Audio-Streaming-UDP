@@ -19,9 +19,8 @@ DEFAULT_AUDIO = "(Zelda) Kokiri Forest.wav"
 
 # ── Streaming ────────────────────────────────────────────────────────
 # O cliente usa este valor para dimensionar o pré-buffer local.
-# O servidor usa o mesmo valor para calcular quantos bytes enviar
-# "na velocidade máxima" antes de começar a respeitar a taxa do áudio.
-SEGUNDOS_PRE_BUFFER = 2.0
+SEGUNDOS_PRE_BUFFER = 4.0
+VELOCIDADE_PREBUFFER = 1_000_000 # bytes por segundos no pré-buffer
 
 # Usado para estimar taxa_bytes quando o formato não permite calcular
 # (ex.: MP3 ou WAV corrompido). Deve ser compatível com o arquivo real,

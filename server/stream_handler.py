@@ -3,14 +3,16 @@ Contrato com o cliente (definido em client/socket_client.py):
   - `obter_info_streaming` retorna o JSON que o cliente espera receber antes do WAV/MP3.
     Os campos obrigatórios são: nome_arquivo, tamanho, taxa_bytes, tamanho_chunk
 
-  - `enviar_arquivo_streaming` envia o WAV/MP3 inteiro (cabeçalho + dados).
+  - `enviar_arquivo_streaming` envia o WAV/MP3 inteiro (cabeçalho + dados),
+     agora em datagramas UDP no formato [seq (4 bytes, big-endian)][até `tamanho_chunk` bytes do arquivo].
+    No final, envia um datagrama de fim (seq = SEQ_FIM, sem payload) 3 vezes.
     O cliente faz o parsing do cabeçalho sozinho.
 
-O total de bytes enviados é exatamente `tamanho` (ou seja, `path.stat().st_size`).
-O cliente compara o recebido com `tamanho_dados` do cabeçalho WAV e reclama se faltar.
+O total de bytes de arquivo enviados é exatamente "tamanho".
 """
 
 import socket
+import struct
 import threading
 import time
 import wave
@@ -23,8 +25,18 @@ from config import (
     EXTENSOES_SUPORTADAS,
     FALLBACK_BITRATE_KBPS,
     SEGUNDOS_PRE_BUFFER,
+    VELOCIDADE_PREBUFFER,
     TAMANHO_BUFFER,
 )
+
+# Cabeçalho de cada datagrama;
+CABECALHO = struct.Struct("!I")
+# Número de sequência pro cliente detectar detectar perda, duplicata e afins (UDP n faz isso sozinho)
+SEQ_FIM = 0xFFFFFFFF
+
+# Payload máximo por datagrama;
+# Mais que 1400 bytes o IP fragmenta o pacote, perdendo o datagrama todo
+TAMANHO_DATAGRAMA = min(TAMANHO_BUFFER, 1400)
 
 # Função que retorna nomes dos arquivos de áudio disponíveis (ordem alfabética)
 def listar_arquivos_audio():
@@ -86,26 +98,28 @@ def obter_info_streaming(path: Path) -> dict:
     OBS: O cliente usa:
       - `taxa_bytes` - dimensionar o Buffer (taxa_bytes * SEGUNDOS_PRE_BUFFER)
       - `tamanho` - detectar fim de transferência truncada
-      - `tamanho_chunk` - só informativo
+      - `tamanho_chunk` - agora obrigatório: é o tamanho do payload de cada datagrama,
+        usado pelo cliente para preencher com silêncio o espaço de um datagrama perdido
     """
     return {
         "nome_arquivo": path.name,
         "tamanho": path.stat().st_size,
         "taxa_bytes": obter_taxa_transmissao(path),
-        "tamanho_chunk": TAMANHO_BUFFER,
+        "tamanho_chunk": TAMANHO_DATAGRAMA,
     }
 
-# Função que envia o arquivo em chunks de TAMANHO_BUFFER, em ritmo contínuo
+# Função que envia o arquivo em datagramas de TAMANHO_DATAGRAMA, em ritmo contínuo
 def enviar_arquivo_streaming(
-    conn: socket.socket,
+    sock: socket.socket,
+    addr,
     path: Path,
     taxa_bytes: int,
     stop_event: threading.Event,
 ) -> int:
     """
     Estratégia:
-      - primeiros `bytes_prebuffer` bytes são enviados o mais rápido possível
-        pra preencher o buffer do cliente sem atrasar o início
+      - os primeiros `bytes_prebuffer` bytes são enviados a até _FATOR_PREBUFFER vezes
+        a velocidade real, pra preencher o buffer do cliente sem atrasar o início
       - depois, cada chunk é liberado de acordo com um relógio absoluto
         (comeco + bytes_já_enviados / taxa); Com isso, atrasos pontuais são
         compensados no chunk seguinte e o cliente fica sempre `pré-buffer`
@@ -113,21 +127,34 @@ def enviar_arquivo_streaming(
     """
     bytes_prebuffer = int(taxa_bytes * SEGUNDOS_PRE_BUFFER)
     bytes_enviados = 0
+    seq = 0
+    terminou_arquivo = False
     comeco = time.monotonic()
 
     with open(path, "rb") as f:
         while not stop_event.is_set():
-            chunk = f.read(TAMANHO_BUFFER)
+            chunk = f.read(TAMANHO_DATAGRAMA)
             if not chunk:
+                terminou_arquivo = True
                 break
 
-            if bytes_enviados > bytes_prebuffer:
+            if bytes_enviados < bytes_prebuffer:
+                liberar_em = comeco + bytes_enviados / VELOCIDADE_PREBUFFER
+            else:
                 liberar_em = comeco + (bytes_enviados - bytes_prebuffer) / taxa_bytes
-                delay = liberar_em - time.monotonic()
-                if delay > 0 and stop_event.wait(delay):
-                    break  # caso do servidor sendo desligado
+            delay = liberar_em - time.monotonic()
+            if delay > 0 and stop_event.wait(delay):
+                break  # caso do servidor sendo desligado ou cliente enviou STOP
 
-            conn.sendall(chunk)
+            sock.sendto(CABECALHO.pack(seq) + chunk, addr)
+            seq += 1
             bytes_enviados += len(chunk)
+
+    # Aqui o fim é avisado com um datagrama especial;
+    # ele tá sendo enviado 3 vezes porque ele próprio pode ser perdido
+    if terminou_arquivo:
+        for _ in range(3):
+            sock.sendto(CABECALHO.pack(SEQ_FIM), addr)
+            time.sleep(0.05)
 
     return bytes_enviados
