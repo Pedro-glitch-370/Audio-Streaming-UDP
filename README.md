@@ -1,4 +1,4 @@
-# SPOTCIN - Audio Streaming UDP
+# SPOTCIN - Audio Streaming UDP (Equipe 3)
 
 Streaming de áudio WAV ou MP3 via sockets UDP.
 O servidor divide o arquivo em blocos e envia em ritmo de reprodução (tempo real) para cada cliente.
